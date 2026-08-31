@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: mikoshi-postgres
+    environment:
+      POSTGRES_DB: mikoshi
+      POSTGRES_USER: mikoshi
+      POSTGRES_PASSWORD: mikoshi
+    ports:
+      - "5432:5432"
+    volumes:
+      - mikoshi_postgres:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/01-vector.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mikoshi -d mikoshi"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+volumes:
+  mikoshi_postgres:

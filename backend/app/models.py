@@ -66,6 +66,29 @@ class Memory(Base):
     tags: Mapped[list] = mapped_column(JSON, default=list)
     embedding: Mapped[list] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+class PersonalitySample(Base):
+    __tablename__ = "personality_samples"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uid)
+
+    persona_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("personas.id", ondelete="CASCADE"),
+        index=True
+    )
+
+    source_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("sources.id", ondelete="CASCADE"),
+        index=True
+    )
+
+    content: Mapped[str] = mapped_column(Text)
+
+    context: Mapped[str | None] = mapped_column(Text)
+
+    embedding: Mapped[list] = mapped_column(JSON, default=list)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
 
 class EvidenceEntity(Base):
     __abstract__ = True

@@ -5,7 +5,17 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from .config import settings
-from .models import Chunk, Memory, PersonalityTrait, Source, Document, Fact, Preference, Opinion
+from .models import (
+    Chunk,
+    Memory,
+    PersonalitySample,
+    PersonalityTrait,
+    Source,
+    Document,
+    Fact,
+    Preference,
+    Opinion
+)
 
 class EmbeddingService:
     """Deterministic local fallback. Replace while retaining embed(text)->list[float]."""
@@ -25,24 +35,71 @@ embeddings = EmbeddingService()
 def clean_text(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", re.sub(r"[ \t]+", " ", text)).strip()
 
-WHATSAPP_LINE = re.compile(r"^(?:\[(?P<bracket>[^\]]+)\]\s*|(?P<date>\d{1,4}[/.\-]\d{1,2}[/.\-]\d{1,4},?\s+\d{1,2}:\d{2}(?::\d{2})?)\s*[-–]\s*)(?P<speaker>[^:]{1,120}):\s?(?P<content>.*)$")
+WHATSAPP_LINE = re.compile(
+    r"^(?:"
+    r"\[(?P<bracket>[^\]]+)\]\s*"
+    r"|"
+    r"(?P<date>\d{1,4}[/.\-]\d{1,4}[/.\-]\d{1,4},?\s+\d{1,2}:\d{2}(?::\d{2})?)\s*[-–]\s*"
+    r")?"
+    r"(?P<speaker>[^:\n]{1,120})"
+    r":\s?"
+    r"(?P<content>.*)$"
+)
 
 def speaker_key(value: str) -> str:
     digits = re.sub(r"\D", "", value)
     return digits if len(digits) >= 7 else re.sub(r"\s+", " ", value).strip().casefold()
 
 def parse_conversation(text: str) -> list[dict]:
-    """Parses common WhatsApp export lines without contacting any platform."""
+    """
+    Aceita:
+    
+    1. WhatsApp com data:
+       2024/02/03, 23:28:23 - João: Olá
+
+    2. WhatsApp com colchetes:
+       [03/02/2024, 23:28:23] João: Olá
+
+    3. Conversa simples:
+       João: Olá
+       Meu numero: Tudo bem?
+
+    4. Mensagens multilinha:
+       João: primeira linha
+       segunda linha
+       terceira linha
+    """
+
     messages: list[dict] = []
+
     for raw_line in text.splitlines():
-        match = WHATSAPP_LINE.match(raw_line.strip())
+        line = raw_line.strip()
+
+        if not line:
+            continue
+
+        match = WHATSAPP_LINE.match(line)
+
         if match:
-            # Some exports use `Nome:: mensagem`; the first colon separates the
-            # speaker and the second is formatting, not part of the message.
-            messages.append({"speaker": match.group("speaker").strip(), "content": match.group("content").lstrip(": ").strip(), "timestamp": match.group("bracket") or match.group("date")})
-        elif messages and raw_line.strip():
-            messages[-1]["content"] += "\n" + raw_line.strip()
-    return [message for message in messages if message["content"] and "<Media omitted>" not in message["content"]]
+            speaker = match.group("speaker").strip()
+            content = match.group("content").strip()
+
+            messages.append({
+                "speaker": speaker,
+                "content": content,
+                "timestamp": match.group("bracket") or match.group("date")
+            })
+
+        elif messages:
+            # Linha sem novo speaker = continuação da mensagem anterior
+            messages[-1]["content"] += "\n" + line
+
+    return [
+        message
+        for message in messages
+        if message["content"]
+        and "<Media omitted>" not in message["content"]
+    ]
 
 def persona_messages_from_conversation(text: str, owner_label: str | None) -> tuple[list[dict], dict]:
     messages = parse_conversation(text)
@@ -79,20 +136,43 @@ def ingest_text(db: Session, persona_id, text: str, source: Source) -> dict:
     own_messages, conversation_metadata = persona_messages_from_conversation(cleaned, (source.metadata_json or {}).get("owner_label"))
     # Only the nominated owner's turns are training material. Other speakers are
     # retained in the raw document, never treated as persona statements.
-    persona_corpus = "\n".join(message["content"] for message in own_messages) if own_messages else cleaned
+    persona_corpus = (
+        "\n".join(message["content"] for message in own_messages)
+        if own_messages
+        else ""
+    )
     parts = chunk_text(persona_corpus)
-    training_parts = parts if own_messages or not conversation_metadata["recognized"] else []
+
+    training_parts = parts if own_messages else []
     for i, content in enumerate(training_parts):
         db.add(Chunk(persona_id=persona_id, source_id=source.id, content=content, chunk_index=i, embedding=embeddings.embed(content), metadata_json={"speaker_scope": "persona" if own_messages else "unverified"}))
     # For a recognized conversation, only the owner messages may become memories.
     # Otherwise the imported text remains unverified and is not treated as persona knowledge.
-    for content in training_parts[:50]:
-        db.add(Memory(persona_id=persona_id, source_id=source.id, content=content, memory_type="semantic", importance=.4, confidence=.6, tags=["imported", "unverified_speaker"], embedding=embeddings.embed(content)))
-    if own_messages:
-        for message in own_messages[:200]:
-            example = (f"Contexto recebido:\n{message['context']}\n\nResposta da persona:\n{message['content']}" if message["context"] else message["content"])
-            db.add(Memory(persona_id=persona_id, source_id=source.id, content=example, memory_type="writing_example", importance=.35, confidence=.8, tags=["conversation", "persona_message"], embedding=embeddings.embed(example)))
-    extracted = extract_declared_evidence(db, persona_id, source.id, persona_corpus) if own_messages or not conversation_metadata["recognized"] else {"preferences": 0, "opinions": 0, "facts": 0, "traits": 0}
+    for message in own_messages[:200]:
+        db.add(
+            PersonalitySample(
+                persona_id=persona_id,
+                source_id=source.id,
+                content=message["content"],
+                context=message.get("context"),
+                embedding=embeddings.embed(message["content"])
+            )
+        )
+    extracted = (
+        extract_declared_evidence(
+            db,
+            persona_id,
+            source.id,
+            persona_corpus
+        )
+        if own_messages
+        else {
+            "preferences": 0,
+            "opinions": 0,
+            "facts": 0,
+            "traits": 0
+        }
+    )
     if own_messages or not conversation_metadata["recognized"]:
         examples_for_analysis = "\n\n".join(
             f"INTERLOCUTOR/CONTEXTO:\n{message['context']}\nPESSOA-ALVO:\n{message['content']}"
@@ -101,7 +181,13 @@ def ingest_text(db: Session, persona_id, text: str, source: Source) -> dict:
         extracted.update(extract_llm_evidence(db, persona_id, source.id, persona_corpus, examples_for_analysis))
     source.metadata_json = {**(source.metadata_json or {}), "processing_status": "complete", "processing_version": 3, "conversation_analysis": conversation_metadata, "derived_evidence": extracted}
     db.commit()
-    return {"chunks": len(training_parts), "memories": len(own_messages) if own_messages else min(len(training_parts), 50), "conversation": conversation_metadata, "evidence": extracted}
+    return {
+        "chunks": len(training_parts),
+        "personality_samples": len(own_messages),
+        "memories": 0,
+        "conversation": conversation_metadata,
+        "evidence": extracted
+    }
 
 def sentences(text: str) -> list[str]:
     return [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", text) if len(s.strip()) >= 5]
@@ -142,7 +228,7 @@ def extract_llm_evidence(db: Session, persona_id, source_id, text: str, conversa
         + "\n\nCONTEXTO DE CONVERSA (não extrair traços/fatos daqui):\n" + conversation_context[:6000]
     )
     try:
-        with httpx.Client(timeout=8) as client:
+        with httpx.Client(timeout=settings.ollama_timeout_seconds) as client:
             raw = client.post(f"{settings.ollama_base_url}/api/generate", json={"model": settings.ollama_model, "prompt": prompt, "stream": False, "format": "json", "options": {"temperature": 0}}).json().get("response", "{}")
         payload = json.loads(raw); result["llm_available"] = True
     except (httpx.HTTPError, ValueError, json.JSONDecodeError):
@@ -184,11 +270,14 @@ def contradictions(db: Session, persona_id, content: str) -> list[Memory]:
     return flagged
 
 async def generate_reply(prompt: str) -> str | None:
+    print("OLLAMA TIMEOUT:", settings.ollama_timeout_seconds)
+    print("OLLAMA MODEL:", settings.ollama_model)
+    print("OLLAMA URL:", settings.ollama_base_url)
     try:
         # A local Ollama instance may be absent or starting. Fail promptly so the
         # consent-safe fallback answer keeps the UI responsive.
         async with httpx.AsyncClient(timeout=settings.ollama_timeout_seconds) as client:
-            response = await client.post(f"{settings.ollama_base_url}/api/generate", json={"model": settings.ollama_model, "prompt": prompt, "stream": False, "think": False, "keep_alive": "15m", "options": {"temperature": 0.42, "top_p": 0.9, "num_predict": 180}})
+            response = await client.post(f"{settings.ollama_base_url}/api/generate", json={"model": settings.ollama_model, "prompt": prompt, "stream": False, "think": False, "keep_alive": "15m", "options": {"temperature": 0.42, "top_p": 0.9, "num_predict": 256,"num_ctx": 8192,"num_batch": 256}})
             response.raise_for_status()
             return response.json().get("response", "").strip() or None
     except (httpx.HTTPError, ValueError):

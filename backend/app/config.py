@@ -7,9 +7,9 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "llama3.2"
     embedding_dimensions: int = 384
-    max_upload_mb: int = 25
+    max_upload_mb: int = 50
     analysis_with_llm: bool = True
-    ollama_timeout_seconds: int = 90
+    ollama_timeout_seconds: int = 280
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 settings = Settings()

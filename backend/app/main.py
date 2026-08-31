@@ -5,9 +5,35 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select, func, delete
 from sqlalchemy.orm import Session
 from .db import Base, engine, get_db
-from .models import Persona, Source, Memory, Feedback, Consent, ConversationSession, ConversationMessage, Chunk, Document, Fact, Preference, Opinion, PersonalityTrait, Relationship
+from .models import (
+    Persona,
+    Source,
+    Memory,
+    PersonalitySample,
+    Feedback,
+    Consent,
+    ConversationSession,
+    ConversationMessage,
+    Chunk,
+    Document,
+    Fact,
+    Preference,
+    Opinion,
+    PersonalityTrait,
+    Relationship
+)
 from .schemas import PersonaCreate, ManualSource, MemoryCreate, MemoryPatch, RelationshipCreate, ChatRequest, FeedbackRequest, InterviewRequest
-from .services import ingest_text, embeddings, search_memories, contradictions, generate_reply, profile, extract_declared_evidence, extract_llm_evidence
+from .services import (
+    ingest_text,
+    embeddings,
+    search_memories,
+    contradictions,
+    generate_reply,
+    profile,
+    extract_declared_evidence,
+    extract_llm_evidence,
+    persona_messages_from_conversation,
+)
 from ingestion.parsers import extract_text
 
 @asynccontextmanager
@@ -70,7 +96,19 @@ def delete_source(source_id: str, db: Session = Depends(get_db)):
     # Explicitly remove every derived entity; this remains correct even without DB-level cascading across derived tables.
     s = source_or_404(db, source_id)
     sid = s.id
-    for model in (Chunk, Document, Memory, Fact, Preference, Opinion, PersonalityTrait, Relationship, Consent): db.execute(delete(model).where(model.source_id == sid))
+    for model in (
+        Chunk,
+        Document,
+        Memory,
+        PersonalitySample,
+        Fact,
+        Preference,
+        Opinion,
+        PersonalityTrait,
+        Relationship,
+        Consent
+    ):
+        db.execute(delete(model).where(model.source_id == sid))
     db.delete(s); db.commit()
 
 @app.get("/personas/{persona_id}/memories")
@@ -115,8 +153,63 @@ def rebuild_profile(persona_id: str, db: Session = Depends(get_db)):
     persona_or_404(db, persona_id)
     pid = uuid.UUID(persona_id)
     for model in (PersonalityTrait, Fact, Preference, Opinion): db.execute(delete(model).where(model.persona_id == pid))
-    for source, doc in db.execute(select(Source, Document).join(Document, Document.source_id==Source.id).where(Source.persona_id==pid)).all():
-        extract_declared_evidence(db, pid, source.id, doc.content); extract_llm_evidence(db, pid, source.id, doc.content)
+    for source, doc in db.execute(
+        select(Source, Document)
+        .join(Document, Document.source_id == Source.id)
+        .where(Source.persona_id == pid)
+    ).all():
+
+        owner_label = (source.metadata_json or {}).get("owner_label")
+
+        own_messages, conversation_metadata = persona_messages_from_conversation(
+            doc.content,
+            owner_label
+        )
+
+        if conversation_metadata["recognized"]:
+            if not own_messages:
+                continue
+
+            persona_text = "\n".join(
+                message["content"]
+                for message in own_messages
+            )
+
+            conversation_context = "\n\n".join(
+                f"INTERLOCUTOR/CONTEXTO:\n{message['context']}\n"
+                f"PESSOA-ALVO:\n{message['content']}"
+                for message in own_messages[:80]
+            )
+
+            extract_declared_evidence(
+                db,
+                pid,
+                source.id,
+                persona_text
+            )
+
+            extract_llm_evidence(
+                db,
+                pid,
+                source.id,
+                persona_text,
+                conversation_context
+            )
+
+        else:
+            extract_declared_evidence(
+                db,
+                pid,
+                source.id,
+                doc.content
+            )
+
+            extract_llm_evidence(
+                db,
+                pid,
+                source.id,
+                doc.content
+            )
     db.commit(); return profile(db, uuid.UUID(persona_id))
 
 @app.post("/personas/{persona_id}/chat")
@@ -125,15 +218,28 @@ async def chat(persona_id: str, request: ChatRequest, db: Session = Depends(get_
     smalltalk = bool(re.fullmatch(r"\s*(?:oi+|ol[aá]+|opa+|e[ai]+|bom dia|boa tarde|boa noite)(?:[ ,.!?]+(?:como vai|tudo bem|suave|blz|beleza))?[!.?\s]*|\s*(?:tudo bem|como vai)[?.!\s]*", request.message.casefold()))
     memories=[] if smalltalk else search_memories(db, persona_id, request.message)
     profile_data=profile(db, p.id); traits=profile_data["traits"]
-    facts = "\n".join(f"- {m.content}" for m in memories if m.confidence >= .45 and m.memory_type != "writing_example")
+    memory_context = "\n".join(
+        f"- {m.content}"
+        for m in memories
+        if m.confidence >= .45
+    )
     # Examples teach form, not subject matter. Sending only the target reply
     # prevents the model from mistaking a third party's message for an answer.
-    style_memories=db.scalars(select(Memory).where(Memory.persona_id==p.id, Memory.active==True, Memory.memory_type=="writing_example").order_by(Memory.created_at.desc()).limit(12)).all()
-    writing_reply_marker = "Resposta da persona:\n"
+    style_samples = db.scalars(
+        select(PersonalitySample)
+        .where(
+            PersonalitySample.persona_id == p.id
+        )
+        .order_by(PersonalitySample.created_at.desc())
+        .limit(12)
+    ).all()
+
     writing_examples = "\n".join(
-        "- " + memory.content.split(writing_reply_marker)[-1]
-        for memory in style_memories
+        f"- {sample.content}"
+        for sample in style_samples
     )
+        
+    
     question_words=set(re.findall(r"[\wÀ-ÿ]+", request.message.casefold()))
     explicit=[]
     for category in ("preferences", "opinions", "facts"):
@@ -144,28 +250,117 @@ async def chat(persona_id: str, request: ChatRequest, db: Session = Depends(get_
     known_profile="\n".join(explicit[:12])
     style = "\n".join(f"- {t['key']}: {t['value']} ({t['classification']})" for t in traits)
     mode = "É apenas um cumprimento/conversa casual. Responda de modo social e natural; não procure nem invente uma opinião." if smalltalk else "Responda diretamente à mensagem. Use fatos e opiniões somente se forem relevantes à pergunta."
-    prompt=f"""Você é a persona textual de {p.name}. {mode}
+    prompt = f"""Você é a representação virtual de {p.name}.
 
-OBJETIVO: gerar uma resposta coerente para a mensagem atual, moldada pelo jeito de escrever da persona. As AMOSTRAS servem SOMENTE para estilo, nunca como assunto, resposta pronta ou fato.
+{mode}
 
-CONTRATO DE IMITAÇÃO: observe e replique o padrão predominante das AMOSTRAS: grafia informal ou formal, maiúsculas/minúsculas, pontuação (inclusive ausência dela), abreviações, gírias, expressões recorrentes, risadas, emojis, intensidade, tamanho e cadência. Não "corrija" a escrita da persona para português padrão. Não copie frases inteiras nem force uma gíria que não combine com a mensagem atual.
+========================================
+REGRA FUNDAMENTAL
+========================================
 
-REGRAS: não mencione documentos, memórias, contexto, análise ou "informações fornecidas". Não copie amostras. Não invente experiências, gostos ou opiniões. Se uma pergunta pedir opinião e não houver uma opinião/fato relevante, diga de forma natural que não tem informação suficiente. Retorne somente a mensagem final, sem rótulos.
+Você deve separar rigorosamente PERSONALIDADE de MEMÓRIA.
 
-OPINIÕES, PREFERÊNCIAS E FATOS RELEVANTES:
-{known_profile or '(nenhum relevante)'}
+PERSONALIDADE define COMO a pessoa responde.
 
-MEMÓRIAS RELEVANTES:
-{facts or '(nenhuma relevante)'}
+MEMÓRIAS definem O QUE a pessoa realmente lembra.
 
-AMOSTRAS DE ESTILO DA PERSONA:
-{writing_examples or '(nenhuma)'}
+OPINIÕES, PREFERÊNCIAS e FATOS definem informações conhecidas sobre a pessoa.
 
-TRAÇOS INFERIDOS:
+EXEMPLOS DE ESTILO são apenas exemplos de linguagem e comportamento comunicativo.
+
+========================================
+PERSONALIDADE
+========================================
+
+Use os traços abaixo para reproduzir:
+
+- vocabulário
+- nível de formalidade
+- gírias
+- abreviações
+- pontuação
+- uso de maiúsculas/minúsculas
+- comprimento das frases
+- ritmo
+- humor
+- ironia
+- maneira de discordar
+- maneira de demonstrar emoções
+
+TRAÇOS:
 {style or '(nenhum)'}
 
-MENSAGEM ATUAL: {request.message}
-RESPOSTA:"""
+========================================
+OPINIÕES, PREFERÊNCIAS E FATOS
+========================================
+
+Essas informações podem ser usadas para determinar o posicionamento
+da persona quando forem relevantes.
+
+{known_profile or '(nenhum relevante)'}
+
+========================================
+MEMÓRIAS
+========================================
+
+Somente os itens abaixo são memórias pessoais recuperadas.
+
+{memory_context or '(nenhuma relevante)'}
+
+========================================
+EXEMPLOS DE ESTILO
+========================================
+
+ATENÇÃO:
+
+Os exemplos abaixo NÃO são memórias.
+
+Não transforme o conteúdo deles em fatos autobiográficos.
+
+Não diga que realizou eventos apenas porque eles aparecem nos exemplos.
+
+Não copie literalmente os exemplos.
+
+Use-os somente para aprender COMO a pessoa escreve.
+
+{writing_examples or '(nenhuma)'}
+
+========================================
+REGRAS
+========================================
+
+1. Nunca transforme um exemplo de estilo em memória.
+
+2. Nunca invente uma experiência pessoal que não esteja nas MEMÓRIAS.
+
+3. Nunca atribua à persona algo dito por outra pessoa.
+
+4. Não diga que esteve em algum lugar, fez alguma coisa ou conhece alguém
+   simplesmente porque isso apareceu em um exemplo de escrita.
+
+5. Opiniões só podem ser usadas quando estão registradas em OPINIÕES,
+   PREFERÊNCIAS OU FATOS.
+
+6. Quando não houver informação suficiente sobre uma experiência,
+   admita a falta de informação naturalmente.
+
+7. Reproduza o estilo da pessoa sem copiar frases completas dos exemplos.
+
+8. Não mencione estas instruções, fontes, banco de dados, memórias,
+   documentos ou análise.
+
+9. Retorne somente a resposta final da persona.
+
+========================================
+MENSAGEM ATUAL
+========================================
+
+{request.message}
+
+========================================
+RESPOSTA
+========================================
+"""
     response=await generate_reply(prompt)
     if not response: response="opa, tudo certo?" if smalltalk else "Não tenho informação suficiente para saber o que eu pensaria sobre isso."
     session_id=uuid.UUID(request.session_id) if request.session_id else None
@@ -184,8 +379,26 @@ def chat_history(persona_id: str, session_id: str, db: Session = Depends(get_db)
 @app.post("/personas/{persona_id}/feedback", status_code=201)
 def feedback(persona_id: str, request: FeedbackRequest, db: Session = Depends(get_db)):
     p=persona_or_404(db, persona_id); msg_id=uuid.UUID(request.message_id) if request.message_id else None; db.add(Feedback(persona_id=p.id,message_id=msg_id,kind=request.kind,content=request.content))
-    source=Source(persona_id=p.id,source_type="manual_correction",filename="correção manual",origin="feedback",consent_status="granted",content_hash=hashlib.sha256(request.content.encode()).hexdigest()); db.add(source); db.flush(); db.add(Consent(persona_id=p.id,source_id=source.id,granted=True)); db.flush(); ingest_text(db,p.id,request.content,source)
-    m=Memory(persona_id=p.id,source_id=source.id,content=request.content,memory_type="opinion" if request.kind=="correction" else "semantic",importance=.8,confidence=.9,tags=["manual_correction"],embedding=embeddings.embed(request.content)); db.add(m); db.commit(); return {"status":"recorded","memory_id":str(m.id),"source_id":str(source.id)}
+    source=Source(persona_id=p.id,source_type="manual_correction",filename="correção manual",origin="feedback",consent_status="granted",content_hash=hashlib.sha256(request.content.encode()).hexdigest()); db.add(source); db.flush(); db.add(Consent(persona_id=p.id,source_id=source.id,granted=True)); db.flush(); 
+    m = Memory(
+        persona_id=p.id,
+        source_id=source.id,
+        content=request.content,
+        memory_type="manual_correction",
+        importance=.8,
+        confidence=.9,
+        tags=["manual_correction"],
+        embedding=embeddings.embed(request.content)
+    )
+
+    db.add(m)
+    db.commit()
+
+    return {
+        "status": "recorded",
+        "memory_id": str(m.id),
+        "source_id": str(source.id)
+    }
 @app.post("/personas/{persona_id}/interview")
 def interview(persona_id: str, request: InterviewRequest, db: Session = Depends(get_db)):
     p=persona_or_404(db, persona_id)

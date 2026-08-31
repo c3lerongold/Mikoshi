@@ -1,4 +1,5 @@
 # Mikoshi
+<<<<<<< HEAD
 
 Mikoshi é uma IA textual local e orientada a consentimento para criar personas digitais a partir de dados fornecidos pela própria pessoa. Ela preserva a origem de cada informação, não inventa memórias e permite apagar uma fonte junto com todos os dados derivados.
 
@@ -111,3 +112,6 @@ scripts/       scripts de inicialização para Windows
 - `GET/POST /personas/{id}/memories`, `PATCH/DELETE /memories/{id}`
 - `POST /personas/{id}/chat`, `POST /personas/{id}/feedback`, `POST /personas/{id}/interview`
 - `GET /personas/{id}/profile`, `POST /personas/{id}/rebuild-profile`
+=======
+A software that try to replicate someone personality
+>>>>>>> 0c72bb5c8b76ea0fbb6d86069e85ef3daa307516

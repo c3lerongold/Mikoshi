@@ -7,6 +7,7 @@
   "available_models": [
     "qwen3:1.7b",
     "llama3.2:3b",
+    "qwen3:8b",
     "gemma3:1b"
   ]
 }
